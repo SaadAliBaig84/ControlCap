@@ -20,7 +20,9 @@ from lavis.models.blip2_models.blip2_t5 import Blip2T5
 from controlcap.models.tagging_heads.bert import BertConfig, BertModel
 from controlcap.models.tagging_heads.asymmetric_loss import AsymmetricLoss
 
-
+# ------------------------------
+# Cross-attention residual block
+# ------------------------------
 class CrossAttnBlock(nn.Module):
     def __init__(self,
                  num_heads,
@@ -34,14 +36,16 @@ class CrossAttnBlock(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
         self.ln_g = norm_layer(hidden_dim)
-        self.cross_attention = nn.MultiheadAttention(hidden_dim, num_heads, dropout=attention_dropout,
-                                                     batch_first=True)
+        self.cross_attention = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=attention_dropout, batch_first=True
+        )
         self.dropout = nn.Dropout(dropout)
 
         self.ln_r = norm_layer(hidden_dim)
         self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
 
     def forward(self, query_embeds, source_embeds):
+        # cross-attend 'query_embeds' to 'source_embeds' and apply residual + MLP
         source_embeds = self.ln_g(source_embeds)
         x, attn = self.cross_attention(query_embeds, source_embeds, source_embeds)
         x = self.dropout(x)
@@ -53,26 +57,49 @@ class CrossAttnBlock(nn.Module):
 
 @registry.register_model("controlcap_t5")
 class ControlCapT5(Blip2T5):
+    """
+    ControlCap-T5:
+      - Visual encoder (frozen ViT from BLIP2)
+      - Q-Former bridge (query tokens attend to visual embeddings)
+      - T5 encoder-decoder as the language backbone (optionally quantized / LoRA)
+      - CVEM (contextual visual embedding module) to build region+context embeddings
+      - CEM (control embedding module) to inject control words into T5 encoder space
+      - EBM (embedding bridging module) to couple vision/control before Q-Former
+      - Tagging head to predict region-level tags (steers control words)
+    """
+
     def __init__(self, *args, **kwargs):
         self.kwargs = kwargs
+
         # Optional memory logging (silent if not requested)
         self.mem_log = kwargs.get("mem_log", False) or os.environ.get("RUN_MEM_LOG", "0") == "1"
+
+        # Pull out kwargs that Blip2T5 base class expects
         base_kwargs = copy.deepcopy(kwargs)
-        base_kwargs_keys = ["vit_model", "img_size", "drop_path_rate", "use_grad_checkpoint", "vit_precision",
-                            "freeze_vit", "num_query_token", "t5_model", "prompt", "max_txt_len", "apply_lemmatizer"]
+        base_kwargs_keys = [
+            "vit_model", "img_size", "drop_path_rate", "use_grad_checkpoint", "vit_precision",
+            "freeze_vit", "num_query_token", "t5_model", "prompt", "max_txt_len", "apply_lemmatizer"
+        ]
         for key in kwargs.keys():
             if key not in base_kwargs_keys:
                 base_kwargs.pop(key)
+
+        # ---- init BLIP2 (ViT + Q-Former + T5) ----
         super().__init__(*args, **base_kwargs)
+
         # AMP mode for Q-Former+T5: {"auto","bf16","fp16","fp32"}; auto=>bf16 if supported else fp32
         self.llm_amp_mode = kwargs.get("llm_amp_mode", "auto")
+
         # Optional micro-batch size for tag head; when not set, keep original behavior
         self.tag_chunk_size = kwargs.get("tag_chunk_size", None)
         self._tag_chunk_logged = False
+
         # New: length-normalize sequence scores during eval (ranking stability)
         self.length_normalize_scores = kwargs.get("length_normalize_scores", False)
 
-        # Accept both naming styles for quantization flags
+        # -------------------------
+        # Quantized T5 (4/8-bit)
+        # -------------------------
         load_4_bit = kwargs.get("load_in_4bit", kwargs.get("load_4_bit", False))
         load_8_bit = kwargs.get("load_in_8bit", kwargs.get("load_8_bit", False))
         if load_4_bit and load_8_bit:
@@ -85,6 +112,7 @@ class ControlCapT5(Blip2T5):
             model_id = base_kwargs.get("t5_model", None)
             if model_id is None:
                 raise ValueError("t5_model must be specified to use quantized loading.")
+
             # Avoid automatic multi-GPU sharding inside a single DDP rank to prevent cross-device embedding lookups
             ddp_active = dist.is_available() and dist.is_initialized()
             if ddp_active:
@@ -93,6 +121,7 @@ class ControlCapT5(Blip2T5):
                 device_map = {"": f"cuda:{local_rank}"}
             else:
                 device_map = "auto"
+
             bnb_cfg = BitsAndBytesConfig(
                 load_in_4bit=load_4_bit,
                 load_in_8bit=load_8_bit,
@@ -115,25 +144,36 @@ class ControlCapT5(Blip2T5):
         else:
             self._is_quantized = False
 
-        # contextual visual embedding module
+        # -------------------------------------
+        # CVEM: build region+context embeddings
+        # -------------------------------------
         input_image_size = self.visual_encoder.image_size
         patch_size = self.visual_encoder.patch_embed.patch_size[0]
-        self._roi_align = torchvision.ops.RoIAlign(output_size=input_image_size//patch_size, spatial_scale=1 / patch_size,
-                                                   sampling_ratio=2)
+        self._roi_align = torchvision.ops.RoIAlign(
+            output_size=input_image_size // patch_size,
+            spatial_scale=1 / patch_size,
+            sampling_ratio=2
+        )
 
         self.cvem_mlp = nn.Sequential(
             nn.Linear(self.visual_encoder.embed_dim * 2, self.visual_encoder.embed_dim),
             nn.ReLU(),
-            nn.Linear(self.visual_encoder.embed_dim, self.visual_encoder.embed_dim))
+            nn.Linear(self.visual_encoder.embed_dim, self.visual_encoder.embed_dim)
+        )
         self.cvem_tag_mlp = nn.Sequential(
             nn.Linear(self.visual_encoder.embed_dim * 2, self.visual_encoder.embed_dim),
             nn.ReLU(),
-            nn.Linear(self.visual_encoder.embed_dim, self.visual_encoder.embed_dim))
+            nn.Linear(self.visual_encoder.embed_dim, self.visual_encoder.embed_dim)
+        )
 
-        # control embedding module
+        # ------------------------------------
+        # CEM: control embedding into T5 space
+        # ------------------------------------
         self.cem_memory = nn.Parameter(torch.zeros(self.t5_model.model_dim))
 
-        # embedding bridging module
+        # -------------------------------------------------
+        # EBM: bridge/control <-> vision via cross-attn MLP
+        # -------------------------------------------------
         ebm_dim = 128
         ebm_num_heads = 8
         self.ebm_c2l_mlp = nn.Linear(self.t5_model.model_dim, ebm_dim)
@@ -143,9 +183,12 @@ class ControlCapT5(Blip2T5):
         self.ebm_cl2vl_ca = CrossAttnBlock(num_heads=ebm_num_heads, hidden_dim=ebm_dim, mlp_dim=ebm_dim)
         self.ebm_vl2cl_ca = CrossAttnBlock(num_heads=ebm_num_heads, hidden_dim=ebm_dim, mlp_dim=ebm_dim)
 
-        # region tagging head
+        # -----------------------------------
+        # Tagging head (predict region tags)
+        # -----------------------------------
         tag_bert_config = BertConfig.from_json_file(
-            kwargs.get("tag_bert_config", "controlcap/models/tagging_heads/tag_bert_config.json"))
+            kwargs.get("tag_bert_config", "controlcap/models/tagging_heads/tag_bert_config.json")
+        )
         tag_bert_config.encoder_width = self.Qformer.config.encoder_width
         self.tag_head = BertModel(config=tag_bert_config, add_pooling_layer=False)
         del self.tag_head.embeddings
@@ -161,7 +204,9 @@ class ControlCapT5(Blip2T5):
         self.tag_weight = 0.005
         self.tag_loss_function = AsymmetricLoss(gamma_neg=7, gamma_pos=0, clip=0.05)
 
-        # Trainable parameters
+        # --------------------------------------
+        # Trainable subset selection + optional LoRA
+        # --------------------------------------
         names = ["cvem", "cem", "tag", "ebm", "Qformer", "t5_proj"]
         self.finetune_llm = kwargs.get("finetune_llm", False)
         if self.finetune_llm:
@@ -192,6 +237,16 @@ class ControlCapT5(Blip2T5):
         for idx, name in enumerate(names):
             print(f"[{name} ratio : {params[idx] / all_params}]")
 
+        # =====================================================================
+        # ### [ADDED for Topic Modeling] — small defaults for topic-guided path
+        # =====================================================================
+        self.topic_gen_k = kwargs.get("topic_gen_k", 3)               # how many high-level keywords to ask T5 for
+        self.topic_bias = kwargs.get("topic_bias", 1.2)               # decoding bias (logit bump) towards topic words
+        self.topic_prefix_max_words = kwargs.get("topic_prefix_max_words", 6)  # cap words per subtopic in prefix
+
+    # --------------------------
+    # ROI pooling for region ViT
+    # --------------------------
     def roi_align(self, image_embeds, samples):
         # prepare cls image embeds and spatio image embeddings
         spatio_image_embeds = image_embeds[:, 1:]
@@ -213,6 +268,9 @@ class ControlCapT5(Blip2T5):
         rois_embeds = torch.cat([cls_image_embeds, spatio_rois_embeds], 1)
         return rois_embeds
 
+    # -------------------------------------------------------
+    # CVEM forward: combine ROI + region image to rich embed
+    # -------------------------------------------------------
     def cvem_forward(self, samples, embeds):
         bz = len(samples["image"])
         image_embeds = embeds[:bz]
@@ -223,6 +281,9 @@ class ControlCapT5(Blip2T5):
         visual_embeds = self.cvem_mlp(visual_embeds)
         return visual_embeds, visual_tag_embeds
 
+    # -------------------------------------------
+    # Tagging head forward (with optional chunk)
+    # -------------------------------------------
     def tag_forward(self, samples, tag_embeds):
         bs = tag_embeds.shape[0]
         device = tag_embeds.device
@@ -265,7 +326,9 @@ class ControlCapT5(Blip2T5):
         tag_logits = torch.cat(logits_chunks, dim=0)
         return tag_logits
 
-    # Autocast context for Q-Former + T5, avoiding BF16 on unsupported GPUs
+    # -------------------------------------------------
+    # Autocast helper for Q-Former + T5 section
+    # -------------------------------------------------
     def _llm_autocast(self):
         mode = getattr(self, "llm_amp_mode", "auto")
         if mode == "auto":
@@ -275,7 +338,10 @@ class ControlCapT5(Blip2T5):
         if mode == "fp16":
             return torch.cuda.amp.autocast(dtype=torch.float16)
         return nullcontext()
-    
+
+    # ---------------------------------------------
+    # CEM: Build control token embeddings for T5
+    # ---------------------------------------------
     def cem_forward(self, tags, embeds):
         control_tokens = self.t5_tokenizer(
             tags,
@@ -291,6 +357,9 @@ class ControlCapT5(Blip2T5):
         control_embeds = control_embeds + self.cem_memory.to(emb_dev, dtype=control_embeds.dtype)
         return control_embeds, control_tokens
 
+    # ---------------------------------------------
+    # EBM: fuse vision/control before Q-Former
+    # ---------------------------------------------
     def ebm_forward(self, v_embeds, c_embeds):
         vl_embeds = self.ebm_v2l_mlp(v_embeds)
         cl_embeds = self.ebm_c2l_mlp(c_embeds)
@@ -300,6 +369,9 @@ class ControlCapT5(Blip2T5):
         c_embeds = c_embeds + self.ebm_l2c_mlp(cl_embeds)
         return v_embeds, c_embeds
 
+    # ---------------------------------------------
+    # Training forward (loss = LLM + tag)
+    # ---------------------------------------------
     def forward(self, samples):
         image = torch.cat([samples["image"], samples["region_images"]], 0)
 
@@ -315,9 +387,7 @@ class ControlCapT5(Blip2T5):
             # Align dtype with Q-Former to avoid Half/Float matmul
             q_dtype = next(self.Qformer.parameters()).dtype
             visual_embeds = visual_embeds.to(dtype=q_dtype)
-            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(
-                image.device
-            )
+            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(image.device)
             query_tokens = self.query_tokens.expand(visual_embeds.shape[0], -1, -1)
             query_output = self.Qformer.bert(
                 query_embeds=query_tokens,
@@ -327,7 +397,7 @@ class ControlCapT5(Blip2T5):
             )
             inputs_t5 = self.t5_proj(query_output.last_hidden_state)
             atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
-            
+
             # Realign devices/dtypes before concat
             control_attn = control_tokens.attention_mask.to(inputs_t5.device)
             control_embeds = control_embeds.to(device=inputs_t5.device, dtype=inputs_t5.dtype)
@@ -345,7 +415,9 @@ class ControlCapT5(Blip2T5):
                 return_tensors="pt",
             ).to(inputs_embeds.device)
 
-            targets = output_tokens.input_ids.masked_fill(output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100)
+            targets = output_tokens.input_ids.masked_fill(
+                output_tokens.input_ids == self.t5_tokenizer.pad_token_id, -100
+            )
 
             outputs = self.t5_model(
                 inputs_embeds=inputs_embeds,
@@ -356,8 +428,15 @@ class ControlCapT5(Blip2T5):
             )
             loss_llm = outputs.loss
 
-            return {"loss": loss_llm + loss_tag, "loss_llm": loss_llm.detach(), "loss_tag": loss_tag.detach()}
+            return {
+                "loss": loss_llm + loss_tag,
+                "loss_llm": loss_llm.detach(),
+                "loss_tag": loss_tag.detach()
+            }
 
+    # --------------------------------------------------------
+    # Build control word strings from tag head (train/eval)
+    # --------------------------------------------------------
     def prepare_control_words(self, samples, tag_logits):
         control_words = []
         full_drop_ratio = self.kwargs.get("full_drop_ratio", 0.5)
@@ -365,6 +444,7 @@ class ControlCapT5(Blip2T5):
         tag_thr = self.kwargs.get("tag_thr", 0.7)
 
         if self.training:
+            # training-time: stochastic word dropping & POS-based hints from GT cap
             for bz_idx, cap in enumerate(samples["caps"]):
                 try:
                     s2 = TextBlob(cap).tags
@@ -403,6 +483,7 @@ class ControlCapT5(Blip2T5):
                 control_words.append(control_word + "|")
             return control_words
         else:
+            # eval-time: threshold tag logits -> pick tag strings
             tag_scores = tag_logits.sigmoid()
             tag_idxs = (tag_scores > tag_thr).to(torch.long)
             stags = [[self.tag_list[tag_idx] for tag_idx in torch.nonzero(tag_idxs[bz_idx][:self.num_tags])]
@@ -452,6 +533,9 @@ class ControlCapT5(Blip2T5):
 
             return control_words, stags, otags
 
+    # ---------------------------------------------------------
+    # Inference: generate region captions + scores + tag sets
+    # ---------------------------------------------------------
     def predict_answers(
             self,
             samples,
@@ -484,12 +568,14 @@ class ControlCapT5(Blip2T5):
             )
             inputs_t5 = self.t5_proj(query_output.last_hidden_state)
             atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
+
             # Realign devices/dtypes before concat
             control_attn = control_tokens.attention_mask.to(inputs_t5.device)
             control_embeds = control_embeds.to(device=inputs_t5.device, dtype=inputs_t5.dtype)
             encoder_atts = torch.cat([atts_t5, control_attn], dim=1)
             inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
 
+            # HF generate kwargs
             llm_kwargs = {
                 "do_sample": False,
                 "num_beams": self.kwargs.get("num_beams", 5),
@@ -499,7 +585,8 @@ class ControlCapT5(Blip2T5):
                 "repetition_penalty": self.kwargs.get("repetition_penalty", None),
                 "num_return_sequences": self.kwargs.get("num_return_sequences", 1),
                 "top_p": self.kwargs.get("top_p", None),
-                "temperature": self.kwargs.get("temperature", None)}
+                "temperature": self.kwargs.get("temperature", None)
+            }
             keys_to_pop = [key for key, value in llm_kwargs.items() if value is None]
             for key in keys_to_pop:
                 llm_kwargs.pop(key)
@@ -533,9 +620,262 @@ class ControlCapT5(Blip2T5):
 
         return output
 
+    # ---------------------------------------------------------
+    # Config builder (unchanged)
+    # ---------------------------------------------------------
     @classmethod
     def from_config(cls, cfg):
         model = cls(**cfg)
         if cfg.pretrained is not None:
             model.load_checkpoint(url_or_filename=cfg.pretrained)
         return model
+
+    # =====================================================================
+    # ==================  [ADDED for Topic Modeling]  ======================
+    # =====================================================================
+
+    def _encode_image_global(self, image_tensor):
+        """
+        ### [ADDED for Topic Modeling]
+        Global image embedding in T5 hidden space (vision -> projector -> L2-normalize).
+        Used to let T5 'see' the whole image semantics without relying on region captions.
+        """
+        with torch.no_grad():
+            v_tokens = self.visual_encoder(image_tensor)  # [1, N, Dv]
+            if hasattr(self, "has_cls_token") and self.has_cls_token:
+                g = v_tokens[:, 0]                       # CLS token if present
+            else:
+                g = v_tokens.mean(dim=1)                 # mean pool patches
+            z = self.vision_proj(g)                      # [1, H] match T5 hidden
+            z = torch.nn.functional.normalize(z, dim=-1)
+        return z
+
+    def _clean_sentencepiece_tokens(self, text):
+        """
+        ### [ADDED for Topic Modeling]
+        Minimal cleanup for the topic string emitted by T5:
+        - grab the part after 'scene_topics:' if present
+        - split on commas/pipes/semicolons/newlines
+        - lowercase, keep letters/spaces only
+        - strip/shorten, dedupe while preserving order
+        """
+        import re
+        seg = text.split("scene_topics:", 1)[-1]
+        raw = re.split(r"[,\|\n;]+", seg)
+        w = []
+        for t in raw:
+            t = t.strip().lower()
+            t = re.sub(r"[^a-z\s]+", " ", t)   # letters only
+            t = re.sub(r"\s+", " ", t).strip()
+            if 1 <= len(t) <= 20:
+                w.append(t)
+        seen, out = set(), []
+        for s in w:
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    def derive_topics_from_image(self, image_tensor, k=None, max_new_tokens=16):
+        """
+        ### [ADDED for Topic Modeling]
+        Ask T5 (via a tiny instruction) to output k short scene keywords directly from the image.
+        No prebuilt topic lists, no generated captions involved.
+
+        Returns: {"main_topic_keywords": [...], "subtopics": [{"keywords":[...], "score":1.0}]}
+        """
+        k = k or self.topic_gen_k
+
+        # Small instruction: keeps behavior focused and cheap
+        instr = f"scene_topics: list {k} short keywords about the whole scene, comma-separated."
+
+        # Encode instruction text. Visual context is handled by the usual generate path (via inputs_embeds).
+        tok = self.t5_tokenizer(instr, return_tensors="pt").to(self.device)
+
+        # NOTE: We rely on the normal generation pipeline (with visual memory) in the topic-guided wrapper.
+        # Here we just turn the raw text into a query; the actual 'seeing' is applied when we call
+        # topic-guided predict (see 'predict_answers_with_topics' below).
+        out_ids = self.t5_model.generate(
+            input_ids=tok.input_ids,
+            attention_mask=tok.attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            num_beams=1,
+            pad_token_id=self.t5_tokenizer.eos_token_id,
+            return_dict_in_generate=False
+        )
+
+        text = self.t5_tokenizer.decode(out_ids[0], skip_special_tokens=True)
+        keywords = self._clean_sentencepiece_tokens(text)
+        keywords = keywords[:k] if k and k > 0 else keywords
+        if not keywords:
+            keywords = ["scene"]
+
+        return {
+            "main_topic_keywords": keywords,
+            "subtopics": [{"keywords": keywords, "score": 1.0}],
+        }
+
+    def _build_topic_prefix(self, topic_info, max_words=None):
+        """
+        ### [ADDED for Topic Modeling]
+        Build a compact, single-line topic hint to prepend to the encoder text.
+        Example: "scene_topics: stadium, player, jersey | crowd, seats, scoreboard."
+        """
+        max_words = max_words or self.topic_prefix_max_words
+        parts = []
+        for st in topic_info.get("subtopics", []):
+            parts.append(", ".join(st["keywords"][:max_words]))
+        if not parts:
+            return ""
+        return f"scene_topics: {' | '.join(parts)}."
+
+    # Small logits bump to gently bias decoding towards topic words
+    from transformers import LogitsProcessor
+    class TopicBiasProcessor(LogitsProcessor):
+        """
+        ### [ADDED for Topic Modeling]
+        HuggingFace logits processor that nudges the softmax towards a set of token ids.
+        """
+        def __init__(self, token_ids, bias=1.2):
+            self.ids = list(set(int(x) for x in token_ids))
+            self.bias = float(bias)
+        def __call__(self, input_ids, scores):
+            if not self.ids:
+                return scores
+            scores[:, self.ids] += self.bias
+            return scores
+
+    def _topic_logits_processor_from_keywords(self, keywords, bias=None):
+        """
+        ### [ADDED for Topic Modeling]
+        Tokenize the topic keywords and build a TopicBiasProcessor over the first sub-token of each.
+        """
+        if not keywords:
+            return None
+        tok_ids = []
+        for w in keywords:
+            ids = self.t5_tokenizer(w, add_special_tokens=False).input_ids
+            if isinstance(ids, list) and ids:
+                if isinstance(ids[0], list):
+                    ids = ids[0]
+                tok_ids.append(ids[0])
+        if not tok_ids:
+            return None
+        return [self.TopicBiasProcessor(tok_ids, bias=bias or self.topic_bias)]
+
+    def predict_answers_with_topics(self, samples, *args, **kwargs):
+        """
+        ### [ADDED for Topic Modeling]
+        Topic-guided inference:
+          1) derive topics from the (whole) image
+          2) prepend a short topic prefix to control text
+          3) optionally add a decoding bias towards topic words
+          4) run the normal generation path
+        """
+        # ----- Step 1: derive topics (image -> keywords)
+        # We use the existing image tensor in samples["image"] (full image batch of size 1 per sample)
+        # If your loader batches >1, we can loop. Here we assume per-sample use.
+        k = kwargs.get("topic_gen_k", self.topic_gen_k)
+        topic_info = self.derive_topics_from_image(samples["image"], k=k)
+        topic_prefix = self._build_topic_prefix(topic_info)
+
+        # ----- Step 2: regular pipeline up to control words
+        image = torch.cat([samples["image"], samples["region_images"]], 0)
+
+        with self.maybe_autocast(dtype=torch.float16):
+            embeds = self.ln_vision(self.visual_encoder(image))
+            visual_embeds, visual_tag_embeds = self.cvem_forward(samples, embeds)
+            tag_logits = self.tag_forward(samples, visual_tag_embeds)
+
+            # Build baseline control words, then prefix with topics (prepend prefix once per sample)
+            control_words, stags, otags = self.prepare_control_words(samples, tag_logits)
+            if isinstance(control_words, tuple):   # train/eval branch differences
+                cw = control_words[0]
+            else:
+                cw = control_words
+            # Prepend topic prefix to each control word string
+            if topic_prefix:
+                cw = [f"{topic_prefix} {x}" if x else f"{topic_prefix} " for x in cw]
+
+            control_embeds, control_tokens = self.cem_forward(cw, visual_embeds)
+            visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
+
+        with self._llm_autocast():
+            # Align dtype with Q-Former to avoid Half/Float matmul
+            q_dtype = next(self.Qformer.parameters()).dtype
+            visual_embeds = visual_embeds.to(dtype=q_dtype)
+            object_atts = torch.ones(visual_embeds.size()[:-1], dtype=torch.long).to(image.device)
+            query_tokens = self.query_tokens.expand(visual_embeds.shape[0], -1, -1)
+            query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=visual_embeds,
+                encoder_attention_mask=object_atts,
+                return_dict=True,
+            )
+            inputs_t5 = self.t5_proj(query_output.last_hidden_state)
+            atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
+
+            # Realign devices/dtypes before concat
+            control_attn = control_tokens.attention_mask.to(inputs_t5.device)
+            control_embeds = control_embeds.to(device=inputs_t5.device, dtype=inputs_t5.dtype)
+            encoder_atts = torch.cat([atts_t5, control_attn], dim=1)
+            inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
+
+            # ----- Step 3: optional decoding bias towards topic words
+            bias = kwargs.get("topic_bias", self.topic_bias)
+            lp = self._topic_logits_processor_from_keywords(topic_info["main_topic_keywords"], bias=bias)
+
+            # HF generate kwargs
+            llm_kwargs = {
+                "do_sample": False,
+                "num_beams": self.kwargs.get("num_beams", 5),
+                "max_new_tokens": self.kwargs.get("max_new_tokens", 10),
+                "min_length": self.kwargs.get("min_length", 1),
+                "length_penalty": self.kwargs.get("length_penalty", -1),
+                "repetition_penalty": self.kwargs.get("repetition_penalty", None),
+                "num_return_sequences": self.kwargs.get("num_return_sequences", 1),
+                "top_p": self.kwargs.get("top_p", None),
+                "temperature": self.kwargs.get("temperature", None),
+                # plug in logits processor if available
+                "logits_processor": lp
+            }
+            keys_to_pop = [key for key, value in llm_kwargs.items() if value is None]
+            for key in keys_to_pop:
+                llm_kwargs.pop(key)
+
+            outputs = self.t5_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=encoder_atts,
+                output_scores=True,
+                return_dict_in_generate=True,
+                **llm_kwargs
+            )
+
+            sequences = outputs["sequences"]
+            scores = outputs["sequences_scores"]
+            scores = torch.exp(scores)
+            l = sequences.shape[1]
+            sequences = sequences.reshape(-1, l)
+            scores = scores.reshape(-1).cpu().numpy().tolist()
+            captions = self.t5_tokenizer.batch_decode(
+                sequences, skip_special_tokens=True
+            )
+
+        if self._apply_lemmatizer:
+            captions = self._lemmatize(captions)
+
+        # Reuse stags/otags from earlier; if you want, you can recompute.
+        output = []
+        for id, caption, score, stag, otag in zip(samples["ids"], captions, scores, stags, otags):
+            output.append(
+                {
+                    "id": id,
+                    "caption": caption,
+                    "score": score,
+                    "tag_set1": stag,
+                    "tag_set2": otag,
+                    "topics": topic_info  # expose topics for debugging/visualization
+                }
+            )
+        return output
