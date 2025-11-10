@@ -26,7 +26,7 @@ def show_mask(mask, image, random_color=True, img_trans=0.9, mask_trans=0.5, ret
         return image
 
 class ControlCap():
-    def __init__(self, args, device='cuda'):
+    def __init__(self, args=None, device='cuda'):
         cfg = Config(args)
         task = tasks.setup_task(cfg)
         model = task.build_model(cfg)
@@ -68,22 +68,29 @@ class ControlCap():
         samples["ids"] = torch.zeros(1).to(torch.int64).to(self.device)
         samples["batch_idx"] = torch.zeros(1).to(torch.int64).to(self.device)
         samples["controls"] = [self.process_controls(controls)]
+
         with torch.inference_mode():
-            output = self.model.predict_answers(samples)
+            use_topics = os.environ.get("USE_TOPICS", "0") == "1"
+            output = (
+                self.model.predict_answers_with_topics(samples)
+                if use_topics else
+                self.model.predict_answers(samples)
+            )
+
         tag_set1_str = ",".join(output[0]["tag_set1"])
         tag_set2_str = ",".join(output[0]["tag_set2"])
         caption = output[0]["caption"]
+        topics = output[0].get("topics", {})
         vis_tag = f"({tag_set1_str}) ({tag_set2_str})"
         vis_cap = f"{caption}"
-        return vis_tag, vis_cap
+        return vis_tag, vis_cap, topics
 
 if __name__ == "__main__":
     image_path = "demo/demo.jpg"
     image = Image.open(image_path).convert("RGB")
     w, h = image.size
     segs = np.zeros((h, w))
-    segs[100:200, 200:400] =1
-    # segs = [[0, 0, w, 0, w, h, 0, h]]
+    segs[100:200, 200:400] = 1
     controlcap = ControlCap()
-    output = controlcap.predict(image, segs)
+    output = controlcap.predict(image, segs, controls="")
     print(output)

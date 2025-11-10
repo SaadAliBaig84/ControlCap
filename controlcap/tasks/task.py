@@ -23,7 +23,6 @@ from lavis.tasks.base_task import BaseTask
 from controlcap.common.evaluation.eval_densecap import DenseCapEvaluator
 
 
-
 @registry.register_task("controlcap")
 class ControlCapTask(BaseTask):
     def __init__(self, *args, **kwargs):
@@ -123,7 +122,6 @@ class ControlCapTask(BaseTask):
                 loss_llm = loss["loss_llm"] if "loss_llm" in loss else 0.
                 loss_tag = loss["loss_tag"] if "loss_tag" in loss else 0.
 
-
             # after_train_step()
             if use_amp:
                 scaler.scale(loss_all).backward()
@@ -165,8 +163,15 @@ class ControlCapTask(BaseTask):
             for k, meter in metric_logger.meters.items()
         }
 
+    # --- NEW: topical toggle for eval ---
     def valid_step(self, model, samples):
-        return model.predict_answers(samples=samples)
+        import os  # ensure available
+        use_topics = os.environ.get("USE_TOPICS", "0") == "1"
+        return (
+            model.predict_answers_with_topics(samples=samples)
+            if use_topics else
+            model.predict_answers(samples=samples)
+        )
 
     def build_model(self, cfg):
         model_config = cfg.model_cfg
@@ -253,6 +258,9 @@ class ControlCapTask(BaseTask):
             gt = json.load(open(self.eval_dataset_ann_path, "r"))
             annotations = gt["annotations"]
 
+            # --- NEW: accumulate per-image topics sidecar ---
+            topics_by_image = {}
+
             for annotation in annotations:
                 id = annotation["id"]
                 if id in id2pred:
@@ -260,10 +268,28 @@ class ControlCapTask(BaseTask):
 
                     annotation["extra_info"]["pred_result"] = copy.deepcopy(pred)
 
+                    # --- NEW: write topics into annotation + sidecar ---
+                    topics = pred.get("topics", {})
+                    if topics:
+                        kws = topics.get("main_topic_keywords", [])
+                        annotation["topics"] = kws
+                        annotation["extra_info"]["scene_topics"] = ", ".join(
+                            [w for w in kws if isinstance(w, str)]
+                        )
+                        img_id = int(annotation.get("image_id", -1))
+                        if img_id >= 0 and img_id not in topics_by_image:
+                            topics_by_image[img_id] = topics
+
             result_file = os.path.join(result_dir, filename + ".json")
 
             with open(result_file, "w") as fw:
                 json.dump(gt, fw)
+
+            # --- NEW: dump sidecar next to val.json ---
+            sidecar = os.path.join(result_dir, "topics_by_image.json")
+            with open(sidecar, "w") as fside:
+                json.dump(topics_by_image, fside, indent=2)
+            logging.info(f":Wrote topics sidecar to ({sidecar}).")
 
             logging.info(f":Get ({num_result}/{len(annotations)}) predictions.")
             logging.info(f":Save result to ({result_file}).")
@@ -330,6 +356,20 @@ class ControlCapTask(BaseTask):
 
             dsize = (w*expand_ratio, h*expand_ratio)
             image = cv2.resize(image, dsize)
+
+            # --- NEW: draw a one-line scene topics header, if present ---
+            scene_kw = None
+            for ann in anns:
+                pr = ann.get("extra_info", {}).get("pred_result", None)
+                if pr and "topics" in pr and pr["topics"]:
+                    scene_kw = pr["topics"].get("main_topic_keywords", [])
+                    break
+            if scene_kw:
+                header = "scene: " + ", ".join([str(w) for w in scene_kw])[:120]
+                cv2.putText(
+                    image, header, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3
+                )
 
             for caption, pos, rgb in captions_to_draw:
                 cv2.putText(image, caption, pos, cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, color=rgb, thickness=3)
@@ -526,4 +566,3 @@ class ControlCapTask(BaseTask):
                 f.write(json.dumps(log_stats) + "\n")
         elif isinstance(stats, list):
             pass
-

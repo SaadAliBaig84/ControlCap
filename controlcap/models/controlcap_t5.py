@@ -66,6 +66,11 @@ class ControlCapT5(Blip2T5):
       - CEM (control embedding module) to inject control words into T5 encoder space
       - EBM (embedding bridging module) to couple vision/control before Q-Former
       - Tagging head to predict region-level tags (steers control words)
+
+      ### [ADDED for Topic Modeling]
+      - derive topics directly from the image
+      - prepend a compact topic prefix into controls
+      - optional logits bias towards topic keywords
     """
 
     def __init__(self, *args, **kwargs):
@@ -774,8 +779,6 @@ class ControlCapT5(Blip2T5):
           4) run the normal generation path
         """
         # ----- Step 1: derive topics (image -> keywords)
-        # We use the existing image tensor in samples["image"] (full image batch of size 1 per sample)
-        # If your loader batches >1, we can loop. Here we assume per-sample use.
         k = kwargs.get("topic_gen_k", self.topic_gen_k)
         topic_info = self.derive_topics_from_image(samples["image"], k=k)
         topic_prefix = self._build_topic_prefix(topic_info)
@@ -790,7 +793,7 @@ class ControlCapT5(Blip2T5):
 
             # Build baseline control words, then prefix with topics (prepend prefix once per sample)
             control_words, stags, otags = self.prepare_control_words(samples, tag_logits)
-            if isinstance(control_words, tuple):   # train/eval branch differences
+            if isinstance(control_words, tuple):   # defensive, although eval path returns tuple
                 cw = control_words[0]
             else:
                 cw = control_words
@@ -865,7 +868,7 @@ class ControlCapT5(Blip2T5):
         if self._apply_lemmatizer:
             captions = self._lemmatize(captions)
 
-        # Reuse stags/otags from earlier; if you want, you can recompute.
+        # Reuse stags/otags from earlier; expose topics alongside each pred
         output = []
         for id, caption, score, stag, otag in zip(samples["ids"], captions, scores, stags, otags):
             output.append(
@@ -878,4 +881,12 @@ class ControlCapT5(Blip2T5):
                     "topics": topic_info  # expose topics for debugging/visualization
                 }
             )
+
+        # --- DEBUG: print topics for first N items if requested ---
+        _dbg_n = int(os.environ.get("TOPIC_DEBUG_N", "0"))
+        if _dbg_n > 0:
+            for i, item in enumerate(output[:_dbg_n]):
+                t = item.get("topics", {})
+                print(f"[TOPICS] id={item['id']} :: {t.get('main_topic_keywords', [])} | sub={t.get('subtopics', [])}")
+
         return output
