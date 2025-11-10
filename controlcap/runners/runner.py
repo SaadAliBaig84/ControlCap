@@ -18,7 +18,7 @@ class ControlCapRunner(RunnerBase):
 
     @property
     def optimizer(self):
-        # TODO make optimizer class and configurations
+        # AdamW with decoupled weight decay for non-norm, non-bias params
         if self._optimizer is None:
             num_parameters = 0
             p_wd, p_non_wd = [], []
@@ -32,10 +32,7 @@ class ControlCapRunner(RunnerBase):
                 num_parameters += p.data.nelement()
             logging.info("number of trainable parameters: %d" % num_parameters)
             optim_params = [
-                {
-                    "params": p_wd,
-                    "weight_decay": float(self.config.run_cfg.weight_decay),
-                },
+                {"params": p_wd, "weight_decay": float(self.config.run_cfg.weight_decay)},
                 {"params": p_non_wd, "weight_decay": 0},
             ]
             beta2 = self.config.run_cfg.get("beta2", 0.999)
@@ -45,13 +42,12 @@ class ControlCapRunner(RunnerBase):
                 weight_decay=float(self.config.run_cfg.weight_decay),
                 betas=(0.9, beta2),
             )
-
         return self._optimizer
 
     @property
     def model(self):
         """
-        A property to get the DDP-wrapped model on the device.
+        Return the (possibly DDP-wrapped) model on the correct device.
         """
         # move model to device
         if self._model.device != self.device:
@@ -107,7 +103,6 @@ class ControlCapRunner(RunnerBase):
                             agg_metrics = val_log["agg_metrics"]
                             if agg_metrics > best_agg_metric and split_name == "val":
                                 best_epoch, best_agg_metric = cur_epoch, agg_metrics
-
                                 self._save_checkpoint(cur_epoch, is_best=True)
 
                             val_log.update({"best_epoch": best_epoch})

@@ -5,13 +5,14 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 
-# imports modules for registration
-from controlcap.tasks import *
-from controlcap.datasets import *
-from controlcap.models import *
-from controlcap.runners import *
+# --- ControlCap registrations (keep order; these import and register components) ---
+from controlcap.tasks import *        # noqa: F401,F403
+from controlcap.datasets import *     # noqa: F401,F403
+from controlcap.models import *       # noqa: F401,F403
+from controlcap.runners import *      # noqa: F401,F403
 from controlcap.common.config import Config
 
+# --- LAVIS infra ---
 import lavis.tasks as tasks
 from lavis.common.dist_utils import get_rank, init_distributed_mode
 from lavis.common.logger import setup_logger
@@ -22,75 +23,78 @@ from lavis.common.optims import (
 from lavis.common.registry import registry
 from lavis.common.utils import now
 
-# imports modules for registration
-from lavis.datasets.builders import *
-from lavis.models import *
-from lavis.processors import *
-from lavis.runners import *
-from lavis.tasks import *
+# (explicit imports so registry side-effects happen)
+from lavis.datasets.builders import *   # noqa: F401,F403
+from lavis.models import *              # noqa: F401,F403
+from lavis.processors import *          # noqa: F401,F403
+from lavis.runners import *             # noqa: F401,F403
+from lavis.tasks import *               # noqa: F401,F403
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Training")
+    parser = argparse.ArgumentParser(description="ControlCap Train/Eval")
 
-    parser.add_argument("--cfg-path", required=True, help="path to configuration file.")
-    parser.add_argument("--local-rank", default=-1, type=int) # for debug
+    parser.add_argument("--cfg-path", required=True, help="Path to YAML config.")
+    parser.add_argument("--local-rank", default=-1, type=int, help="For torch.distributed (debug ok).")
+
+    # Override any config field on the CLI:
+    # Example:
+    #   --options run.batch_size_eval=1 model.tag_chunk_size=4 model.num_beams=1
     parser.add_argument(
         "--options",
         nargs="+",
-        help="override some settings in the used config, the key-value pair "
-        "in xxx=yyy format will be merged into config file (deprecate), "
-        "change to --cfg-options instead.",
+        help=(
+            "Override settings in the config. Use key=value pairs; nested with dots. "
+            "Examples: run.batch_size_eval=1 model.tag_chunk_size=4"
+        ),
     )
 
-    args = parser.parse_args()
-    # if 'LOCAL_RANK' not in os.environ:
-    #     os.environ['LOCAL_RANK'] = str(args.local_rank)
+    return parser.parse_args()
 
-    return args
 
 def setup_seeds(config):
-    seed = config.run_cfg.seed + get_rank()
-
+    """Make runs reproducible across ranks."""
+    seed = int(config.run_cfg.seed) + get_rank()
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
     cudnn.benchmark = False
     cudnn.deterministic = True
 
-def get_runner_class(cfg):
-    """
-    Get runner class from config. Default to epoch-based runner.
-    """
-    runner_cls = registry.get_runner_class(cfg.run_cfg.get("task", "controlcap"))
 
-    return runner_cls
+def get_runner_class(cfg):
+    """Runner choice is controlled by run.task; default to 'controlcap'."""
+    return registry.get_runner_class(cfg.run_cfg.get("task", "controlcap"))
+
 
 def main():
-    # allow auto-dl completes on main process without timeout when using NCCL backend.
-    # os.environ["NCCL_BLOCKING_WAIT"] = "1"
-
-    # set before init_distributed_mode() to ensure the same job_id shared across all ranks.
+    # Single job id shared across ranks (set before init_distributed_mode).
     job_id = now()
 
-    cfg = Config(parse_args())
+    # Parse CLI and build config
+    args = parse_args()
+    cfg = Config(args)
 
+    # Init distributed (or noop if world size == 1)
     init_distributed_mode(cfg.run_cfg)
 
+    # Seeds after dist init
     setup_seeds(cfg)
 
-    # set after init_distributed_mode() to only log on master.
+    # Logger only talks on master
     setup_logger()
 
+    # Print effective config once
     cfg.pretty_print()
 
+    # Build task/datasets/model via registry
     task = tasks.setup_task(cfg)
     datasets = task.build_datasets(cfg)
     model = task.build_model(cfg)
 
-    runner = get_runner_class(cfg)(
-        cfg=cfg, job_id=job_id, task=task, model=model, datasets=datasets
-    )
+    # Build runner and go
+    runner_cls = get_runner_class(cfg)
+    runner = runner_cls(cfg=cfg, job_id=job_id, task=task, model=model, datasets=datasets)
     runner.train()
 
 

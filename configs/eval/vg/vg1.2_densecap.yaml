@@ -1,13 +1,52 @@
-base: ["configs/base/runs/eval.yaml",
-       "configs/base/models/controlcap_flant5xl.yaml",
-       "configs/base/datasets/vg/vg1.2.yaml",
-]
+# ===== ControlCap DenseCap Evaluation on VG 1.2 =====
+
+base:
+  - "configs/base/runs/eval.yaml"                    # sets evaluate-only flow
+  - "configs/base/models/controlcap_flant5xl.yaml"   # BLIP2-T5XL backbone + ControlCap heads
+  - "configs/base/datasets/vg/vg1.2.yaml"            # Visual Genome 1.2 val split
 
 model:
+  # --- ControlCap thresholds/decoding ---
   tag_thr: 0.7
-  first_word_control: False
+  first_word_control: false
+
+  # --- NEW: topic-guided path defaults (tunable via --options or env) ---
+  topic_gen_k: 3              # how many scene keywords to derive
+  topic_bias: 1.2             # logits bump toward topic tokens
+  topic_prefix_max_words: 6   # cap words per subtopic in prefix
+
+  # --- NEW: VRAM helpers ---
+  tag_chunk_size: 4           # chunk tag head forward; set 0/omit to disable
+
+  # --- HF generate defaults (can override on CLI) ---
+  num_beams: 1
+  max_new_tokens: 8
+  min_length: 1
+  length_penalty: -1
+
+  # --- Quantization toggles (kept off here; turn on via --options if desired) ---
+  load_in_4bit: false
+  load_in_8bit: false
 
 run:
-  batch_size_eval: 4
+  # --- I/O / ckpt ---
   output_dir: "output/eval/vg1.2"
+  load_ckpt_path: "ckpts/vg1.2_refcocog_5e.pth"
+
+  # --- dataset selection ---
   eval_dataset_name: "vg1.2"
+
+  # --- dataloader ---
+  batch_size_eval: 1           # keep 1 for safety; you can raise if memory allows
+  num_workers: 1               # Kaggle kernel friendly
+
+  # --- visualization ---
+  visualize: false             # set true to draw captions+topics overlays
+
+  # --- optimization stubs (unused in eval, required by runner types) ---
+  init_lr: 1e-5
+  weight_decay: 0.05
+  beta2: 0.98
+
+  # --- runner/dispatch ---
+  task: "controlcap"           # ensures our custom runner/task are used

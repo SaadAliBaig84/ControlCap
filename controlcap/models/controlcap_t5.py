@@ -604,12 +604,18 @@ class ControlCapT5(Blip2T5):
                 **llm_kwargs
             )
 
-            sequences = outputs["sequences"]
-            scores = outputs["sequences_scores"]
-            scores = torch.exp(scores)
+            # ---- Robust extraction across HF versions ----
+            sequences = getattr(outputs, "sequences", outputs["sequences"])
+            seq_scores = getattr(outputs, "sequences_scores", None)
+            if seq_scores is None:
+                # Older transformers may not return sequence scores when beams=1.
+                # Fallback to 1.0 so downstream code continues.
+                seq_scores = torch.ones(sequences.shape[0], device=sequences.device)
+            scores = torch.exp(seq_scores) if seq_scores.dtype.is_floating_point else seq_scores
+
             l = sequences.shape[1]
             sequences = sequences.reshape(-1, l)
-            scores = scores.reshape(-1).cpu().numpy().tolist()
+            scores = scores.reshape(-1).detach().cpu().numpy().tolist()
             captions = self.t5_tokenizer.batch_decode(
                 sequences, skip_special_tokens=True
             )
@@ -855,12 +861,16 @@ class ControlCapT5(Blip2T5):
                 **llm_kwargs
             )
 
-            sequences = outputs["sequences"]
-            scores = outputs["sequences_scores"]
-            scores = torch.exp(scores)
+            # ---- Robust extraction across HF versions ----
+            sequences = getattr(outputs, "sequences", outputs["sequences"])
+            seq_scores = getattr(outputs, "sequences_scores", None)
+            if seq_scores is None:
+                seq_scores = torch.ones(sequences.shape[0], device=sequences.device)
+            scores = torch.exp(seq_scores) if seq_scores.dtype.is_floating_point else seq_scores
+
             l = sequences.shape[1]
             sequences = sequences.reshape(-1, l)
-            scores = scores.reshape(-1).cpu().numpy().tolist()
+            scores = scores.reshape(-1).detach().cpu().numpy().tolist()
             captions = self.t5_tokenizer.batch_decode(
                 sequences, skip_special_tokens=True
             )
