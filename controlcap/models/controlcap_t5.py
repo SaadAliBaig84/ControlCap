@@ -1,4 +1,5 @@
 # controlcap/models/controlcap_t5.py
+# (Drop-in replacement with improved topic quality / biasing)
 
 import math
 import copy
@@ -24,7 +25,6 @@ from lavis.models.blip2_models.blip2_t5 import Blip2T5
 from controlcap.models.tagging_heads.bert import BertConfig, BertModel
 from controlcap.models.tagging_heads.asymmetric_loss import AsymmetricLoss
 
-# HF logits processor for gentle topic biasing
 from transformers.generation.logits_process import LogitsProcessor
 
 
@@ -65,28 +65,28 @@ class CrossAttnBlock(nn.Module):
 @registry.register_model("controlcap_t5")
 class ControlCapT5(Blip2T5):
     """
-    ControlCap-T5 (topic-aware, tag-head first):
-      - Visual encoder (frozen ViT from BLIP2)
-      - Q-Former bridge (query tokens attend to visual embeddings)
-      - T5 encoder-decoder as the language backbone (optionally quantized / LoRA)
-      - CVEM (contextual visual embedding module) to build region+context embeddings
-      - CEM (control embedding module) to inject control words into T5 encoder space
-      - EBM (embedding bridging module) to couple vision/control before Q-Former
-      - Tagging head to predict region-level tags (steers control words and topics)
-
-      Topic strategy (for eval/inference):
-      1) Derive scene topics from the tag head (threshold + top-k).  **Primary**
-      2) (Optional) If not enough tags, fall back to a tiny visually-conditioned T5 topic probe. **Fallback**
-      3) Prepend a compact "scene_topics: ..." prefix to control text and optionally bias logits.
+    ControlCap-T5:
+      - BLIP2 ViT + Q-Former + T5 backbone (optionally quantized/LoRA)
+      - CVEM/CEM/EBM to couple vision and control words
+      - Tag head guides control words
+      - NEW: cleaner, concrete topic extraction & gentle decoding bias
     """
+
+    # --- very small, conservative set of vague words we want to filter out as topics ---
+    _TOPIC_STOPWORDS = {
+        "color", "colours", "colors",
+        "side", "sides", "corner", "corners",
+        "white", "black", "gray", "grey", "dark", "light",
+        "person", "people", "man", "woman", "men", "women", "boy", "girl",
+        "thing", "things", "stuff", "object", "objects",
+        "place", "area", "room", "part", "end", "top", "bottom", "left", "right",
+        "background", "foreground"
+    }
 
     def __init__(self, *args, **kwargs):
         self.kwargs = kwargs
-
-        # Optional memory logging
         self.mem_log = kwargs.get("mem_log", False) or os.environ.get("RUN_MEM_LOG", "0") == "1"
 
-        # Pull out kwargs that Blip2T5 base class expects
         base_kwargs = copy.deepcopy(kwargs)
         base_kwargs_keys = [
             "vit_model", "img_size", "drop_path_rate", "use_grad_checkpoint", "vit_precision",
@@ -96,17 +96,11 @@ class ControlCapT5(Blip2T5):
             if key not in base_kwargs_keys:
                 base_kwargs.pop(key, None)
 
-        # ---- init BLIP2 (ViT + Q-Former + T5) ----
         super().__init__(*args, **base_kwargs)
 
-        # AMP mode for Q-Former+T5: {"auto","bf16","fp16","fp32"}; auto=>bf16 if supported else fp32
         self.llm_amp_mode = kwargs.get("llm_amp_mode", "auto")
-
-        # Optional micro-batch size for tag head; when not set, keep original behavior
         self.tag_chunk_size = kwargs.get("tag_chunk_size", None)
         self._tag_chunk_logged = False
-
-        # New: length-normalize sequence scores during eval (ranking stability)
         self.length_normalize_scores = kwargs.get("length_normalize_scores", False)
 
         # -------------------------
@@ -140,7 +134,6 @@ class ControlCapT5(Blip2T5):
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.float16,
             )
-            # Replace full-precision T5 with quantized version
             del self.t5_model
             gc.collect()
             torch.cuda.empty_cache()
@@ -247,15 +240,10 @@ class ControlCapT5(Blip2T5):
             print(f"[{name} ratio : {params[idx] / all_params}]")
 
         # =====================================================================
-        # Topic Modeling knobs (tag-first)
+        # ### [Topic Modeling] — defaults & knobs
         # =====================================================================
-        self.topic_topk = kwargs.get("topic_topk", 5)                  # top-K tags after threshold
-        self.topic_thr_tags = kwargs.get("topic_thr_tags", 0.35)       # sigmoid threshold for topics
-        self.topic_min_count = kwargs.get("topic_min_count", 2)        # if < this, optionally fallback
-        self.topic_use_fallback_t5 = kwargs.get("topic_use_fallback_t5", True)
-        self.topic_fallback_k = kwargs.get("topic_fallback_k", 3)
-
-        self.topic_bias = kwargs.get("topic_bias", 0.8)                # small bias towards topic words
+        self.topic_gen_k = kwargs.get("topic_gen_k", 3)
+        self.topic_bias = kwargs.get("topic_bias", 0.6)  # gentler default
         self.topic_prefix_max_words = kwargs.get("topic_prefix_max_words", 6)
 
     # --------------------------
@@ -280,7 +268,7 @@ class ControlCapT5(Blip2T5):
         return rois_embeds
 
     # -------------------------------------------------------
-    # CVEM forward: combine ROI + region image to rich embed
+    # CVEM forward
     # -------------------------------------------------------
     def cvem_forward(self, samples, embeds):
         bz = len(samples["image"])
@@ -377,7 +365,7 @@ class ControlCapT5(Blip2T5):
         return v_embeds, c_embeds
 
     # ---------------------------------------------
-    # Training forward (loss = LLM + tag)
+    # Training forward
     # ---------------------------------------------
     def forward(self, samples):
         image = torch.cat([samples["image"], samples["region_images"]], 0)
@@ -616,18 +604,57 @@ class ControlCapT5(Blip2T5):
 
         return output
 
+    @classmethod
+    def from_config(cls, cfg):
+        model = cls(**cfg)
+        if cfg.pretrained is not None:
+            model.load_checkpoint(url_or_filename=cfg.pretrained)
+        return model
+
     # =====================================================================
-    # ==================  Topic Modeling (tag-first)  ======================
+    # ==================  [Topic Modeling Helpers]  ========================
     # =====================================================================
 
-    def _clean_tokens_simple(self, words):
-        """Lowercase, strip, dedupe while preserving order; keep short natural tokens."""
-        out, seen = [], set()
-        for w in words:
-            if not isinstance(w, str):
+    def _clean_sentencepiece_tokens(self, text):
+        """
+        Cleanup for the topic string emitted by T5:
+        - cut after 'scene_topics:' if present
+        - split on commas/pipes/semicolons/newlines
+        - lowercase; keep letters/spaces only
+        - drop vague/stop words and keep (mostly) nouns
+        - dedupe while preserving order
+        """
+        import re
+        seg = text.split("scene_topics:", 1)[-1]
+        raw = re.split(r"[,\|\n;]+", seg)
+
+        # pre-clean
+        cand = []
+        for t in raw:
+            t = t.strip().lower()
+            t = re.sub(r"[^a-z\s]+", " ", t)   # letters only
+            t = re.sub(r"\s+", " ", t).strip()
+            if 1 <= len(t) <= 30:
+                cand.append(t)
+
+        # drop stopwords & POS filter to nouns where possible
+        out = []
+        seen = set()
+        for w in cand:
+            if w in self._TOPIC_STOPWORDS:
                 continue
-            w = w.strip().lower()
-            if 0 < len(w) <= 30 and w not in seen:
+            # very short non-words
+            if len(w) <= 2:
+                continue
+            # POS gate (keep if has a noun anywhere)
+            try:
+                tags = TextBlob(w).tags
+                if not any(pos.startswith("NN") for _, pos in tags):
+                    continue
+            except Exception:
+                # if POS fails, keep the candidate (we already filtered obvious stuff)
+                pass
+            if w and (w not in seen):
                 seen.add(w)
                 out.append(w)
         return out
@@ -642,7 +669,7 @@ class ControlCapT5(Blip2T5):
         return f"scene_topics: {' | '.join(parts)}."
 
     class TopicBiasProcessor(LogitsProcessor):
-        def __init__(self, token_ids, bias=0.8):
+        def __init__(self, token_ids, bias=1.2):
             super().__init__()
             self.ids = list(set(int(x) for x in token_ids))
             self.bias = float(bias)
@@ -662,45 +689,14 @@ class ControlCapT5(Blip2T5):
             if isinstance(ids, list) and ids:
                 if isinstance(ids[0], list):
                     ids = ids[0]
-                if len(ids) > 0:
-                    tok_ids.append(ids[0])
+                tok_ids.append(ids[0])
         if not tok_ids:
             return None
         return [self.TopicBiasProcessor(tok_ids, bias=bias or self.topic_bias)]
 
-    def _topics_from_tag_logits(self, tag_logits):
-        """
-        Derive scene-level topics from per-region tag predictions:
-        - Apply sigmoid + threshold per region
-        - Count tag frequency over regions, keep top-K
-        """
-        scores = tag_logits.sigmoid()  # [R, 2*num_tags]
-        thr = float(self.topic_thr_tags)
-
-        # Take positives from both halves (self/other tags).
-        mask = scores > thr
-        # Collapse over regions (sum frequency)
-        freq = mask.sum(dim=0)  # [2*num_tags]
-        # Merge mirrored indices: 0..num_tags-1 and num_tags..2*num_tags-1
-        a = freq[:self.num_tags]
-        b = freq[self.num_tags:2*self.num_tags]
-        merged = a + b  # [num_tags]
-
-        # Top-K indices by frequency
-        k = int(self.topic_topk)
-        if k <= 0:
-            k = 5
-        topk = torch.topk(merged, k=min(k, merged.numel()), largest=True)
-        idxs = topk.indices.tolist()
-        vals = topk.values.tolist()
-
-        # Keep only tags that actually appeared (freq>0)
-        kept = [(self.tag_list[i], int(vals[j])) for j, i in enumerate(idxs) if vals[j] > 0]
-        words = [w for (w, c) in kept]
-        words = self._clean_tokens_simple(words)
-        return words
-
-    # -------------- Optional visual fallback (rarely used) --------------
+    # -------------------------------
+    # Visually-conditioned topic gen
+    # -------------------------------
     def _global_visual_tokens_for_t5(self, image_tensor):
         device = next(self.parameters()).device
         with self.maybe_autocast(dtype=torch.float16):
@@ -717,19 +713,58 @@ class ControlCapT5(Blip2T5):
             atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long, device=device)
         return inputs_t5, atts_t5
 
-    def _derive_topics_fallback_t5(self, image_tensor, k=3, max_new_tokens=16):
+    def _keep_top_tag_nouns(self, tag_logits, topk=8, thr=0.7):
         """
-        Very small visually-conditioned T5 prompt used ONLY if tags are too sparse.
-        This stays on-rank device to avoid cross-device issues.
+        Convert high-confidence tag logits into a small list of noun-like keywords.
         """
+        if tag_logits is None:
+            return []
+        with torch.no_grad():
+            sc = tag_logits.sigmoid()
+            values, idxs = torch.topk(sc, k=min(topk, sc.shape[1]), dim=1)
+            words = []
+            for b in range(values.shape[0]):
+                for v, idx in zip(values[b], idxs[b]):
+                    if float(v) < thr:
+                        continue
+                    w = self.tag_list[int(idx)]
+                    # POS noun gate + stopword filter
+                    try:
+                        tags = TextBlob(w).tags
+                        if not any(pos.startswith("NN") for _, pos in tags):
+                            continue
+                    except Exception:
+                        pass
+                    if w.lower() in self._TOPIC_STOPWORDS:
+                        continue
+                    words.append(w.lower())
+            # dedupe keep order
+            out, seen = [], set()
+            for w in words:
+                if w not in seen:
+                    seen.add(w)
+                    out.append(w)
+            return out
+
+    def derive_topics_from_image(self, image_tensor, k=None, max_new_tokens=16):
+        """
+        Ask T5 (visually conditioned) to output k short scene keywords.
+        Uses a stricter instruction to avoid vague tokens.
+        """
+        k = k or self.topic_gen_k
         device = next(self.parameters()).device
+
         with torch.no_grad():
             inputs_t5, atts_t5 = self._global_visual_tokens_for_t5(image_tensor)
 
-        instr = f"scene_topics: list {k} short keywords about the whole scene, comma-separated."
+        # Stricter, more concrete instruction
+        instr = (
+            f"scene_topics: list {k} short concrete object/place/action keywords "
+            f"(no colors, no directions, no vague words), comma-separated."
+        )
         tok = self.t5_tokenizer(instr, return_tensors="pt").to(device)
         instr_ids = tok.input_ids
-        instr_emb = self.t5_model.encoder.embed_tokens(instr_ids)  # [1, L, H]
+        instr_emb = self.t5_model.encoder.embed_tokens(instr_ids)
         instr_att = tok.attention_mask
 
         enc_embeds = torch.cat([inputs_t5, instr_emb], dim=1)
@@ -747,63 +782,62 @@ class ControlCapT5(Blip2T5):
             )
 
         text = self.t5_tokenizer.decode(out_ids[0], skip_special_tokens=True)
-        # minimal cleanup: split on commas/pipes/semicolons
-        import re
-        raw = re.split(r"[,\|\n;]+", text.split("scene_topics:", 1)[-1])
-        words = [re.sub(r"[^a-z\s]+", " ", w.lower()).strip() for w in raw]
-        words = [re.sub(r"\s+", " ", w) for w in words if 1 <= len(w) <= 30]
-        seen, out = set(), []
-        for w in words:
-            if w and w not in seen:
+        keywords = self._clean_sentencepiece_tokens(text)
+        keywords = keywords[:k] if k and k > 0 else keywords
+        if not keywords:
+            keywords = ["scene"]
+
+        return {
+            "main_topic_keywords": keywords,
+            "subtopics": [{"keywords": keywords, "score": 1.0}],
+        }
+
+    def _refine_topics_with_tags(self, topic_info, tag_logits, k=None):
+        """
+        Blend topic keywords with high-confidence tag nouns to anchor topics to objects.
+        """
+        k = k or self.topic_gen_k
+        base = topic_info.get("main_topic_keywords", [])[:]
+        tag_nouns = self._keep_top_tag_nouns(tag_logits, topk=8, thr=0.7)
+        merged, seen = [], set()
+        for w in base + tag_nouns:
+            if w and (w not in seen) and (w not in self._TOPIC_STOPWORDS):
                 seen.add(w)
-                out.append(w)
-        if k and k > 0:
-            out = out[:k]
-        if not out:
-            out = ["scene"]
-        return out
+                merged.append(w)
+        merged = merged[:max(1, k)]
+        topic_info["main_topic_keywords"] = merged
+        topic_info["subtopics"] = [{"keywords": merged, "score": 1.0}]
+        return topic_info
 
     # ---------------------------------------------------------
-    # Topic-guided inference (TAG-FIRST)
+    # Topic-guided inference (derive topics -> bias captions)
     # ---------------------------------------------------------
     def predict_answers_with_topics(self, samples, *args, **kwargs):
-        """
-        1) Run vision -> tag head to get tag_logits.
-        2) Build topics from tags (threshold + top-k). If too few, optional T5 fallback.
-        3) Prepend topic prefix to control text, add small logits bias, then decode captions.
-        """
-        # Step 1: push vision through CVEM + tag head (NO captioning yet)
+        # Step 1: derive initial topics (image -> keywords)
+        k = kwargs.get("topic_gen_k", self.topic_gen_k)
+        topic_info = self.derive_topics_from_image(samples["image"], k=k)
+
+        # Step 2: regular pipeline up to tag logits
         image = torch.cat([samples["image"], samples["region_images"]], 0)
+
         with self.maybe_autocast(dtype=torch.float16):
             embeds = self.ln_vision(self.visual_encoder(image))
             visual_embeds, visual_tag_embeds = self.cvem_forward(samples, embeds)
             tag_logits = self.tag_forward(samples, visual_tag_embeds)
 
-        # Step 2: derive topics from tag head (primary)
-        topic_words = self._topics_from_tag_logits(tag_logits)
-        # Fallback: optionally probe with a tiny visually-conditioned T5 prompt
-        if self.topic_use_fallback_t5 and len(topic_words) < int(self.topic_min_count):
-            try:
-                topic_words = self._derive_topics_fallback_t5(samples["image"], k=int(self.topic_fallback_k))
-            except Exception:
-                topic_words = topic_words if topic_words else ["scene"]
+            # NEW: refine topics using high-confidence tag nouns
+            topic_info = self._refine_topics_with_tags(topic_info, tag_logits, k=k)
+            topic_prefix = self._build_topic_prefix(topic_info)
 
-        topic_info = {
-            "main_topic_keywords": topic_words,
-            "subtopics": [{"keywords": topic_words, "score": 1.0}] if topic_words else []
-        }
-        topic_prefix = self._build_topic_prefix(topic_info)
-
-        # Step 3: build control words then prefix topics
-        with self.maybe_autocast(dtype=torch.float16):
+            # Build control words and prefix with refined topics
             control_words, stags, otags = self.prepare_control_words(samples, tag_logits)
             cw = control_words[0] if isinstance(control_words, tuple) else control_words
             if topic_prefix:
                 cw = [f"{topic_prefix} {x}" if x else f"{topic_prefix} " for x in cw]
+
             control_embeds, control_tokens = self.cem_forward(cw, visual_embeds)
             visual_embeds, control_embeds = self.ebm_forward(visual_embeds, control_embeds)
 
-        # Step 4: caption with gentle topic bias
         with self._llm_autocast():
             q_dtype = next(self.Qformer.parameters()).dtype
             visual_embeds = visual_embeds.to(dtype=q_dtype)
@@ -823,7 +857,8 @@ class ControlCapT5(Blip2T5):
             encoder_atts = torch.cat([atts_t5, control_attn], dim=1)
             inputs_embeds = torch.cat([inputs_t5, control_embeds], dim=1)
 
-            lp = self._topic_logits_processor_from_keywords(topic_words, bias=self.topic_bias)
+            bias = kwargs.get("topic_bias", self.topic_bias)
+            lp = self._topic_logits_processor_from_keywords(topic_info["main_topic_keywords"], bias=bias)
 
             llm_kwargs = {
                 "do_sample": False,
@@ -886,13 +921,3 @@ class ControlCapT5(Blip2T5):
                 print(f"[TOPICS] id={item['id']} :: {t.get('main_topic_keywords', [])} | sub={t.get('subtopics', [])}")
 
         return output
-
-    # ---------------------------------------------------------
-    # Config builder (unchanged)
-    # ---------------------------------------------------------
-    @classmethod
-    def from_config(cls, cfg):
-        model = cls(**cfg)
-        if cfg.pretrained is not None:
-            model.load_checkpoint(url_or_filename=cfg.pretrained)
-        return model
