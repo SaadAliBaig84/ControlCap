@@ -1,24 +1,31 @@
+# controlcap/models/controlcap_t5.py
+
 import math
 import copy
 import random
 import os
 import gc
-import torch.distributed as dist
 from contextlib import nullcontext
 from functools import partial
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import torchvision
-from textblob import TextBlob
 from torchvision.models.vision_transformer import MLPBlock
+
+from textblob import TextBlob
 from peft import LoraConfig, get_peft_model
 
 from lavis.common.registry import registry
 from lavis.models.blip2_models.blip2_t5 import Blip2T5
+
 from controlcap.models.tagging_heads.bert import BertConfig, BertModel
 from controlcap.models.tagging_heads.asymmetric_loss import AsymmetricLoss
+
+# HF logits processor for gentle topic biasing
+from transformers.generation.logits_process import LogitsProcessor
 
 
 # ------------------------------
@@ -68,8 +75,8 @@ class ControlCapT5(Blip2T5):
       - EBM (embedding bridging module) to couple vision/control before Q-Former
       - Tagging head to predict region-level tags (steers control words)
 
-      ### [ADDED for Topic Modeling]
-      - derive topics directly from the image
+      ### [Topic Modeling]
+      - derive topics directly from the image (visually conditioned)
       - prepend a compact topic prefix into controls
       - optional logits bias towards topic keywords
     """
@@ -243,11 +250,11 @@ class ControlCapT5(Blip2T5):
             print(f"[{name} ratio : {params[idx] / all_params}]")
 
         # =====================================================================
-        # ### [ADDED for Topic Modeling] — small defaults for topic-guided path
+        # ### [Topic Modeling] — defaults & knobs
         # =====================================================================
-        self.topic_gen_k = kwargs.get("topic_gen_k", 3)               # how many high-level keywords to ask T5 for
-        self.topic_bias = kwargs.get("topic_bias", 1.2)               # decoding bias (logit bump) towards topic words
-        self.topic_prefix_max_words = kwargs.get("topic_prefix_max_words", 6)  # cap words per subtopic in prefix
+        self.topic_gen_k = kwargs.get("topic_gen_k", 3)               # how many high-level keywords
+        self.topic_bias = kwargs.get("topic_bias", 1.2)               # decoding bias towards topic words
+        self.topic_prefix_max_words = kwargs.get("topic_prefix_max_words", 6)  # cap words per subtopic
 
     # --------------------------
     # ROI pooling for region ViT
@@ -467,7 +474,7 @@ class ControlCapT5(Blip2T5):
                             words.append(word)
                     else:
                         words = [""]
-                except:
+                except Exception:
                     words = [""]
                 tag_idxs = samples["tags"]
                 stags = [self.tag_list[tag_idx] for tag_idx in torch.nonzero(tag_idxs[bz_idx][:self.num_tags])]
@@ -517,7 +524,7 @@ class ControlCapT5(Blip2T5):
                                 words.append(word)
                         else:
                             words = []
-                    except:
+                    except Exception:
                         words = []
                     if len(words) > 0:
                         first_word = [words[0]]
@@ -596,17 +603,12 @@ class ControlCapT5(Blip2T5):
                 **llm_kwargs
             )
 
-            # --- robust extraction: some decoding paths don't return `sequences_scores`
-            if hasattr(outputs, "sequences"):
-                sequences = outputs.sequences
-            else:
-                sequences = outputs["sequences"]
-
+            # robust extraction
+            sequences = outputs.sequences if hasattr(outputs, "sequences") else outputs["sequences"]
             if (hasattr(outputs, "sequences_scores") and outputs.sequences_scores is not None) or ("sequences_scores" in outputs):
                 seq_scores = outputs.sequences_scores if hasattr(outputs, "sequences_scores") else outputs["sequences_scores"]
                 scores = torch.exp(seq_scores)
             else:
-                # Fallback: uniform scores
                 scores = torch.ones(sequences.size(0), device=sequences.device)
 
             l = sequences.shape[1]
@@ -638,28 +640,11 @@ class ControlCapT5(Blip2T5):
         return model
 
     # =====================================================================
-    # ==================  [ADDED for Topic Modeling]  ======================
+    # ==================  [Topic Modeling Helpers]  ========================
     # =====================================================================
-
-    def _encode_image_global(self, image_tensor):
-        """
-        ### [ADDED for Topic Modeling]
-        Global image embedding in T5 hidden space (vision -> projector -> L2-normalize).
-        Used to let T5 'see' the whole image semantics without relying on region captions.
-        """
-        with torch.no_grad():
-            v_tokens = self.visual_encoder(image_tensor)  # [1, N, Dv]
-            if hasattr(self, "has_cls_token") and self.has_cls_token:
-                g = v_tokens[:, 0]                       # CLS token if present
-            else:
-                g = v_tokens.mean(dim=1)                 # mean pool patches
-            z = self.vision_proj(g)                      # [1, H] match T5 hidden
-            z = torch.nn.functional.normalize(z, dim=-1)
-        return z
 
     def _clean_sentencepiece_tokens(self, text):
         """
-        ### [ADDED for Topic Modeling]
         Minimal cleanup for the topic string emitted by T5:
         - grab the part after 'scene_topics:' if present
         - split on commas/pipes/semicolons/newlines
@@ -683,46 +668,8 @@ class ControlCapT5(Blip2T5):
                 out.append(s)
         return out
 
-    def derive_topics_from_image(self, image_tensor, k=None, max_new_tokens=16):
-        """
-        ### [ADDED for Topic Modeling]
-        Ask T5 (via a tiny instruction) to output k short scene keywords directly from the image.
-        No prebuilt topic lists, no generated captions involved.
-
-        Returns: {"main_topic_keywords": [...], "subtopics": [{"keywords":[...], "score":1.0}]}
-        """
-        k = k or self.topic_gen_k
-
-        # Small instruction: keeps behavior focused and cheap
-        instr = f"scene_topics: list {k} short keywords about the whole scene, comma-separated."
-
-        # Encode instruction text. Visual context is handled by the usual generate path (via inputs_embeds).
-        tok = self.t5_tokenizer(instr, return_tensors="pt").to(self.device)
-
-        out_ids = self.t5_model.generate(
-            input_ids=tok.input_ids,
-            attention_mask=tok.attention_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            num_beams=1,
-            pad_token_id=self.t5_tokenizer.eos_token_id,
-            return_dict_in_generate=False
-        )
-
-        text = self.t5_tokenizer.decode(out_ids[0], skip_special_tokens=True)
-        keywords = self._clean_sentencepiece_tokens(text)
-        keywords = keywords[:k] if k and k > 0 else keywords
-        if not keywords:
-            keywords = ["scene"]
-
-        return {
-            "main_topic_keywords": keywords,
-            "subtopics": [{"keywords": keywords, "score": 1.0}],
-        }
-
     def _build_topic_prefix(self, topic_info, max_words=None):
         """
-        ### [ADDED for Topic Modeling]
         Build a compact, single-line topic hint to prepend to the encoder text.
         Example: "scene_topics: stadium, player, jersey | crowd, seats, scoreboard."
         """
@@ -734,16 +681,15 @@ class ControlCapT5(Blip2T5):
             return ""
         return f"scene_topics: {' | '.join(parts)}."
 
-    # Small logits bump to gently bias decoding towards topic words
-    from transformers import LogitsProcessor
     class TopicBiasProcessor(LogitsProcessor):
         """
-        ### [ADDED for Topic Modeling]
         HuggingFace logits processor that nudges the softmax towards a set of token ids.
         """
         def __init__(self, token_ids, bias=1.2):
+            super().__init__()
             self.ids = list(set(int(x) for x in token_ids))
             self.bias = float(bias)
+
         def __call__(self, input_ids, scores):
             if not self.ids:
                 return scores
@@ -752,7 +698,6 @@ class ControlCapT5(Blip2T5):
 
     def _topic_logits_processor_from_keywords(self, keywords, bias=None):
         """
-        ### [ADDED for Topic Modeling]
         Tokenize the topic keywords and build a TopicBiasProcessor over the first sub-token of each.
         """
         if not keywords:
@@ -768,16 +713,86 @@ class ControlCapT5(Blip2T5):
             return None
         return [self.TopicBiasProcessor(tok_ids, bias=bias or self.topic_bias)]
 
+    # -------------------------------
+    # Visually-conditioned topic gen
+    # -------------------------------
+    def _global_visual_tokens_for_t5(self, image_tensor):
+        """
+        Compute language-aligned visual tokens from the whole image:
+        ViT -> ln_vision -> Q-Former -> t5_proj
+        Return: (inputs_t5, atts_t5) ready to be concatenated with text/control embeddings.
+        """
+        device = next(self.parameters()).device
+        with self.maybe_autocast(dtype=torch.float16):
+            vis_tokens = self.ln_vision(self.visual_encoder(image_tensor))  # [B, N, Dv]
+            # Attend with Q-Former query tokens
+            object_atts = torch.ones(vis_tokens.size()[:-1], dtype=torch.long, device=device)
+            query_tokens = self.query_tokens.expand(vis_tokens.shape[0], -1, -1)
+            q_out = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=vis_tokens,
+                encoder_attention_mask=object_atts,
+                return_dict=True,
+            )
+            inputs_t5 = self.t5_proj(q_out.last_hidden_state)                   # [B, nq, Ht5]
+            atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long, device=device)
+        return inputs_t5, atts_t5
+
+    def derive_topics_from_image(self, image_tensor, k=None, max_new_tokens=16):
+        """
+        Ask T5 (visually conditioned) to output k short scene keywords.
+        Implementation detail:
+          - Build global visual tokens (Q-Former -> t5_proj)
+          - Build an instruction string and its token embeddings
+          - Concatenate [visual_embeds ; instruction_embeds] and call T5.generate()
+        Returns: {"main_topic_keywords": [...], "subtopics": [{"keywords":[...], "score":1.0}]}
+        """
+        k = k or self.topic_gen_k
+        device = next(self.parameters()).device
+
+        # (1) Visual tokens (no regions): use only the whole image
+        with torch.no_grad():
+            inputs_t5, atts_t5 = self._global_visual_tokens_for_t5(image_tensor)
+
+        # (2) Short instruction
+        instr = f"scene_topics: list {k} short keywords about the whole scene, comma-separated."
+        tok = self.t5_tokenizer(instr, return_tensors="pt").to(device)
+        instr_ids = tok.input_ids
+        instr_emb = self.t5_model.encoder.embed_tokens(instr_ids)  # [1, L, H]
+        instr_att = tok.attention_mask
+
+        # (3) Concat visual + instruction into encoder inputs
+        enc_embeds = torch.cat([inputs_t5, instr_emb], dim=1)             # [1, nq+L, H]
+        enc_atts = torch.cat([atts_t5, instr_att], dim=1)                 # [1, nq+L]
+
+        # (4) Generate keywords (deterministic)
+        with self._llm_autocast():
+            out_ids = self.t5_model.generate(
+                inputs_embeds=enc_embeds,
+                attention_mask=enc_atts,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+                pad_token_id=self.t5_tokenizer.eos_token_id,
+                return_dict_in_generate=False
+            )
+
+        text = self.t5_tokenizer.decode(out_ids[0], skip_special_tokens=True)
+        keywords = self._clean_sentencepiece_tokens(text)
+        keywords = keywords[:k] if k and k > 0 else keywords
+        if not keywords:
+            keywords = ["scene"]
+
+        return {
+            "main_topic_keywords": keywords,
+            "subtopics": [{"keywords": keywords, "score": 1.0}],
+        }
+
+    # ---------------------------------------------------------
+    # Topic-guided inference (derive topics -> bias captions)
+    # ---------------------------------------------------------
     def predict_answers_with_topics(self, samples, *args, **kwargs):
-        """
-        ### [ADDED for Topic Modeling]
-        Topic-guided inference:
-          1) derive topics from the (whole) image
-          2) prepend a short topic prefix to control text
-          3) optionally add a decoding bias towards topic words
-          4) run the normal generation path
-        """
-        # ----- Step 1: derive topics (image -> keywords)
+        # ----- Step 1: derive topics (image -> keywords, visually conditioned)
         k = kwargs.get("topic_gen_k", self.topic_gen_k)
         topic_info = self.derive_topics_from_image(samples["image"], k=k)
         topic_prefix = self._build_topic_prefix(topic_info)
@@ -792,11 +807,7 @@ class ControlCapT5(Blip2T5):
 
             # Build baseline control words, then prefix with topics (prepend prefix once per sample)
             control_words, stags, otags = self.prepare_control_words(samples, tag_logits)
-            if isinstance(control_words, tuple):   # defensive, although eval path returns tuple
-                cw = control_words[0]
-            else:
-                cw = control_words
-            # Prepend topic prefix to each control word string
+            cw = control_words[0] if isinstance(control_words, tuple) else control_words
             if topic_prefix:
                 cw = [f"{topic_prefix} {x}" if x else f"{topic_prefix} " for x in cw]
 
@@ -854,12 +865,8 @@ class ControlCapT5(Blip2T5):
                 **llm_kwargs
             )
 
-            # --- robust extraction: some decoding paths don't return `sequences_scores`
-            if hasattr(outputs, "sequences"):
-                sequences = outputs.sequences
-            else:
-                sequences = outputs["sequences"]
-
+            # robust extraction
+            sequences = outputs.sequences if hasattr(outputs, "sequences") else outputs["sequences"]
             if (hasattr(outputs, "sequences_scores") and outputs.sequences_scores is not None) or ("sequences_scores" in outputs):
                 seq_scores = outputs.sequences_scores if hasattr(outputs, "sequences_scores") else outputs["sequences_scores"]
                 scores = torch.exp(seq_scores)
@@ -877,7 +884,7 @@ class ControlCapT5(Blip2T5):
         if self._apply_lemmatizer:
             captions = self._lemmatize(captions)
 
-        # Reuse stags/otags from earlier; expose topics alongside each pred
+        # Reuse stags/otags; expose topics alongside each pred
         output = []
         for id, caption, score, stag, otag in zip(samples["ids"], captions, scores, stags, otags):
             output.append(

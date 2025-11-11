@@ -1,3 +1,5 @@
+# controlcap/tasks/task.py
+
 import copy
 import logging
 import json
@@ -9,7 +11,6 @@ import cv2
 import numpy as np
 import torch
 import torch.distributed as dist
-import matplotlib.pyplot as plt
 import pycocotools.mask as mask_util
 from pycocotools.coco import COCO
 from pycocoevalcap.eval import COCOEvalCap
@@ -157,7 +158,7 @@ class ControlCapTask(BaseTask):
         for name in datasets_config:
             dataset_config = datasets_config[name]
 
-            # If evaluating, drop train split build
+            # If evaluating, drop train split build (saves time/mem)
             if self.evaluate and (
                 (self.eval_dataset_name is None and name == list(datasets_config)[0])
                 or (self.eval_dataset_name is not None and name == self.eval_dataset_name)
@@ -208,11 +209,8 @@ class ControlCapTask(BaseTask):
             gt = json.load(open(self.eval_dataset_ann_path, "r"))
             annotations = gt["annotations"]
 
-            # NEW: accumulate per-image topics sidecar
+            # Accumulate per-image topics sidecar
             topics_by_image = {}
-            num_result = 0
-
-            # If requested, limit the metrics/images we keep
             max_keep = self.max_eval_images
             kept = 0
 
@@ -223,6 +221,7 @@ class ControlCapTask(BaseTask):
                 if id in id2pred:
                     kept += 1
                     pred = id2pred[id]
+                    annotation.setdefault("extra_info", {})
                     annotation["extra_info"]["pred_result"] = copy.deepcopy(pred)
 
                     topics = pred.get("topics", {})
@@ -278,17 +277,19 @@ class ControlCapTask(BaseTask):
                 pred_result = extra_info.get('pred_result', None)
                 if pred_result is None:
                     continue
-                caption = pred_result['caption']
+                caption = pred_result.get('caption', "")
                 stags = pred_result.get('tag_set1', [])
                 otags = pred_result.get('tag_set2', [])
                 vis_caption = '[' + ','.join(stags) + '][' + ','.join(otags) + '][' + caption + ']'
-                seg = ann["segmentation"]
+                seg = ann.get("segmentation", None)
+                if seg is None:
+                    continue
                 if isinstance(seg, list):
                     mask = np.zeros((h, w), np.uint8)
                     for seg_ in seg:
                         mask = cv2.fillPoly(mask, np.array(seg_).reshape(1, -1, 2).astype(np.int64), 1)
                 else:
-                    if isinstance(seg["counts"], list):
+                    if isinstance(seg.get("counts", []), list):
                         seg = mask_util.frPyObjects(seg, *seg["size"])
                     elif not isinstance(seg["counts"], bytes):
                         seg["counts"] = seg["counts"].encode()
@@ -413,7 +414,7 @@ class ControlCapTask(BaseTask):
             scores, boxes, text = [], [], []
             for pred in preds:
                 box = seg2bbox(pred['segmentation'])
-                pred_result = pred['extra_info'].get('pred_result', None)
+                pred_result = pred.get('extra_info', {}).get('pred_result', None)
                 if pred_result is None:
                     continue
                 score = pred_result.get('score', 1)
@@ -461,10 +462,10 @@ class ControlCapTask(BaseTask):
         # prediction
         result = COCO(result_file)
         for id, ann in result.anns.items():
-            pred_result = ann["extra_info"].get("pred_result", None)
+            pred_result = ann.get("extra_info", {}).get("pred_result", None)
             if pred_result is None:
                 raise ValueError(f"Pred result for [{self.eval_dataset_name}] is not found")
-            ann['caption'] = pred_result["caption"]
+            ann['caption'] = pred_result.get("caption", "")
 
         # ground truth
         gt_dict = {
